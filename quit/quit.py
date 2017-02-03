@@ -621,7 +621,7 @@ def resultFormat():
 
 def main():
     """Start the app."""
-    app.run(debug=True, use_reloader=False)
+    app.run(debug=True, use_reloader=False, host=args.host, port=args.port)
 
 
 if __name__ == '__main__':
@@ -642,6 +642,8 @@ if __name__ == '__main__':
         'localconfig',
         'repoconfig'
     ], help=graphhelp)
+    parser.add_argument('-p', '--port', default=5000, type=int)
+    parser.add_argument('--host', default='0.0.0.0', type=str)
     args = parser.parse_args()
 
     objects = initialize(args)
