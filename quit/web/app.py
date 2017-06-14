@@ -29,7 +29,7 @@ DROPDOWN_TEMPLATE="""
             <li class="divider"></li>
             <li class="dropdown-header">Tags</li>
             {% for tag in tags %}
-                <li><a href="#">{{ tag }}</a></li>
+                <li><a href="{{ url_for(request.endpoint, branch_or_ref=tag) }}">{{ tag }}</a></li>
             {% endfor %}
         {% endif %}        
     </ul>
@@ -170,19 +170,23 @@ def register_template_helpers(app):
                 return '"%s"'%t
         return t
 
+    @app.context_processor
+    def context_processor():
+        def render_dropdown(available_branches, available_tags):
+            return rts(DROPDOWN_TEMPLATE, branches=[x.lstrip('refs/heads/') for x in available_branches], tags=[x.lstrip('refs/tags/') for x in available_tags])
+
+        return dict(render_dropdown=render_dropdown)
+
 def render_template(template_name_or_list, **kwargs):
 
     quit = current_app.config['quit']
 
     available_branches = quit.repository.branches
     available_tags = quit.repository.tags
-
-    dropdown = rts(DROPDOWN_TEMPLATE, branches=[x.lstrip('refs/heads/') for x in available_branches], tags=[x.lstrip('refs/tags/') for x in available_tags])
-
+    
     context = {
         'available_branches': available_branches,
-        'available_tags': available_tags, 
-        'dropdown': dropdown
+        'available_tags': available_tags
     }
     context.update(kwargs)
 

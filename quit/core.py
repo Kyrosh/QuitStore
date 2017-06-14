@@ -249,7 +249,7 @@ class Quit(object):
                 self.store.remove((None,None,None), c) 
 
         def exists(id):
-            uri = QUIT['version-' + id]
+            uri = QUIT['commit-' + id]
             for _ in self.store.store.quads((uri, None, None, QUIT.default)):
                 return True
             return False
@@ -1193,7 +1193,7 @@ class InMemoryGraphAggregate(ConjunctiveGraph):
 
     @property
     def is_dirty(self):
-        return len(self.store) > 0
+        return len(list(self.store.contexts())) > 0
 
     def _spoc(self, triple_or_quad, default=False):
         """
@@ -1219,14 +1219,24 @@ class InMemoryGraphAggregate(ConjunctiveGraph):
 
     def add(self, triple_or_quad):
         s,p,o,c = self._spoc(triple_or_quad, default=True)
+        if isinstance(c, InMemoryGraphAggregate.InMemoryGraph):
+            c.force()
         self.store.add((s, p, o), context=c, quoted=False)
 
     def addN(self, quads):
-        self.store.addN((s, p, o, self._graph(c)) for s, p, o, c in quads)
+        def do(g):
+            g = self._graph(g)
+            if isinstance(g, InMemoryGraphAggregate.InMemoryGraph):
+                g.force()
+            return g
+
+        self.store.addN((s, p, o, do(c)) for s, p, o, c in quads)
 
     def remove(self, triple_or_quad):
         s,p,o,c = self._spoc(triple_or_quad)
-        self.store.remove((s, p, o), context=c_copy(c))
+        if isinstance(c, InMemoryGraphAggregate.InMemoryGraph):
+            c.force()
+        self.store.remove((s, p, o), context=c)
 
     def contexts(self, triple=None):
         for graph in self.__graphs:
@@ -1331,12 +1341,11 @@ class Blame(object):
         #if not quads:
         quads = [x for x in g.store.quads((None, None, None))]
 
-        print(quads)
+        if len(quads) == 0:
+            return []
 
         values = self._generate_values(quads)
         values_string = ft.reduce(lambda acc, quad: acc + '( %s %s %s %s )\n' % quad, values, '') 
-
-        print(values_string)
 
         q = """
             SELECT ?s ?p ?o ?context ?hex ?name ?email ?date WHERE {                
@@ -1369,4 +1378,4 @@ class Blame(object):
             }                
             """ % values_string
 
-        return self.quit.store.store.query(q, initNs = { 'foaf': FOAF, 'prov': PROV, 'quit': QUIT }, initBindings = { 'commit': QUIT['commit-' + commit.id] })
+        return list(self.quit.store.store.query(q, initNs = { 'foaf': FOAF, 'prov': PROV, 'quit': QUIT }, initBindings = { 'commit': QUIT['commit-' + commit.id] }))
