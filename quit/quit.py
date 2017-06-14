@@ -99,7 +99,7 @@ def savedexit():
     Add methods you want to call on unexpected shutdown.
     """
     logger.info("Exiting store")
-    store.exit()
+    #store.exit()
     logger.info("Store exited")
 
     return

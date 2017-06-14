@@ -50,7 +50,7 @@
 
 conf:store a <QuitStore> ;
   <allowNewGraphs> 1 ;
-  <pathOfGitRepo> "c:/git.default3" ;
+  <pathOfGitRepo> "d:/git.default3" ;
   <defaultBranch> "master" ;
   <globalFile> "global.nq" .
 
