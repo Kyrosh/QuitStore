@@ -1,7 +1,10 @@
+import os
 import pygit2
+import logging
+import functools as ft
+import re
 
 from datetime import datetime
-import logging
 from os import makedirs
 from os.path import abspath, exists, isdir, join
 from subprocess import Popen
@@ -12,172 +15,23 @@ from pygit2 import GIT_SORT_REVERSE, GIT_RESET_HARD, GIT_STATUS_CURRENT
 from pygit2 import init_repository, clone_repository
 from pygit2 import Repository, Signature, RemoteCallbacks, Keypair, UserPass
 
-from rdflib import ConjunctiveGraph, Graph, URIRef, BNode, Literal, BNode, Namespace
+from rdflib import Graph, ConjunctiveGraph, Dataset, Literal, URIRef, BNode, Namespace
 from rdflib import plugin
 from rdflib.store import Store as DefaultStore
-from rdflib.graph import ReadOnlyGraphAggregate
+from rdflib.plugins.memory import IOMemory
+from rdflib.graph import Node, ReadOnlyGraphAggregate, ModificationException, UnSupportedAggregateOperation, Path
 
 from quit.namespace import RDF, RDFS, FOAF, XSD, PROV, QUIT, is_a
-from quit.graphs import ReadOnlyRewriteGraph, InMemoryGraphAggregate
-from quit.utils import graphdiff
+from quit.exceptions import RepositoryNotFound, RevisionNotFound, NodeNotFound
+from quit.utils import graphdiff, clean_path
+
+from datetime import datetime
 
 corelogger = logging.getLogger('core.quit')
 
-class FileReference:
-    """A class that manages n-quad files.
-
-    This class stores inforamtation about the location of a n-quad file and is
-    able to add and delete triples/quads to that file.
-    """
-
-    def __init__(self, filelocation, versioning=True):
-        """Initialize a new FileReference instance.
-
-        Args:
-            filelocation: A string of the filepath.
-            versioning: Boolean if versioning is enabled or not. (Defaults true)
-            filecontentinmem: Boolean to decide if local filesystem should be used to
-                or if file content should be kept in memory too . (Defaults false)
-
-        Raises:
-            ValueError: If no file at the filelocation, or in the given directory + filelocation.
-        """
-        self.logger = logging.getLogger('file_reference_core.quit')
-        self.logger.debug('Create an instance of FileReference')
-        self.content = None
-        self.path = abspath(filelocation)
-        self.modified = False
-
-        return
-
-    def __getcontent(self):
-        """Return the content of a n-quad file.
-
-        Returns:
-            content: A list of strings where each string is a quad.
-        """
-        return self.content
-
-    def __setcontent(self, content):
-        """Set the content of a n-quad file.
-
-        Args:
-            content: A list of strings where each string is a quad.
-        """
-        self.content = content
-        return
-
-    def getgraphfromfile(self):
-        """Return a Conjunctive Graph generated from the referenced file.
-
-        Returns:
-            A ConjunctiveGraph
-        """
-        graph = ConjunctiveGraph()
-
-        try:
-            graph.parse(self.path, format='nquads', publicID='http://localhost:5000/')
-            self.logger.debug('Success: File', self.path, 'parsed')
-            # quadstring = graph.serialize(format="nquads").decode('UTF-8')
-            # quadlist = quadstring.splitlines()
-            # self.__setcontent(quadlist)
-        except:
-            # Given file contains non valid rdf data
-            # self.logger.debug('Error: File', self.path, 'not parsed')
-            # self.__setcontent([[None][None][None][None]])
-            pass
-
-        return graph
-
-    def getcontent(self):
-        """Public method that returns the content of a nquad file.
-
-        Returns:
-            content: A list of strings where each string is a quad.
-        """
-        return self.__getcontent()
-
-    def setcontent(self, content):
-        """Public method to set the content of a n-quad file.
-
-        Args:
-            content: A list of strings where each string is a quad.
-        """
-        self.__setcontent(content)
-        return
-
-    def savefile(self):
-        """Save the file."""
-        f = open(self.path, "w")
-
-        self.logger.debug('Saving file:', self.path)
-        content = self.__getcontent()
-        for line in content:
-            f.write(line + '\n')
-        f.close
-
-        self.logger.debug('File saved')
-
-    def sortcontent(self):
-        """Order file content."""
-        content = self.__getcontent()
-
-        try:
-            self.__setcontent(sorted(content))
-        except AttributeError:
-            pass
-
-    def addquads(self, quads):
-        """Add quads to the file content."""
-        self.content.append(quads)
-        self.content = list(set(self.content))
-        self.sortcontent()
-
-        return
-
-    def addquad(self, quad):
-        """Add a quad to the file content."""
-        if(self.quadexists(quad)):
-            return
-
-        self.content.append(quad)
-
-        return
-
-    def quadexists(self, quad):
-        """Look if a quad is in the file content.
-
-        Returns:
-            True if quad was found, False else
-        """
-        searchPattern = quad
-
-        if searchPattern in self.content:
-            return True
-
-        return False
-
-    def deletequads(self, quads):
-        """Remove quads from the file content."""
-        for quad in quads:
-            self.content.remove(quad)
-
-        return True
-
-    def deletequad(self, quad):
-        """Remove a quad from the file content."""
-        try:
-            self.content.remove(quad)
-            self.modified = True
-        except ValueError:
-            # not in list
-            pass
-
-        return
-
-    def isversioned(self):
-        """Check if a File is part of version control system."""
-        return(self.versioning)
+#######################################
+# Store implementation
+#######################################
 
 class Queryable:
     """
@@ -360,6 +214,10 @@ class MemoryStore(Store):
             store.bind(prefix, namespace)
         super().__init__(store=store)
 
+#######################################
+# Graph wrapper
+#######################################
+
 class VirtualGraph(Queryable):
     def __init__(self, store):
         if not isinstance(store, InMemoryGraphAggregate):
@@ -371,6 +229,10 @@ class VirtualGraph(Queryable):
 
     def update(self, querystring, versioning=True):
         return self.store.update(querystring)
+
+#######################################
+# Quit
+#######################################
 
 class Quit(object):
     def __init__(self, config, repository, store):
@@ -619,349 +481,60 @@ class Quit(object):
                 self.repository._repository.checkout(ref, strategy=pygit2.GIT_CHECKOUT_FORCE)
             self.sync()
 
-class GitRepo:
-    """A class that manages a git repository.
+#######################################
+# Graph Extensions for rewriting
+#######################################
 
-    This class enables versiong via git for a repository.
-    You can stage and commit files and checkout different commits of the repository.
-    """
+# roles
+role_author = QUIT['author']
+role_committer = QUIT['committer']
 
-    path = ''
-    pathspec = []
-    repo = None
-    callback = None
-    author_name = 'QuitStore'
-    author_email = 'quit@quit.aksw.org'
-    gcProcess = None
+def _git_timestamp(ts, offset):
+    import quit.utils as tzinfo
+    if offset == 0:
+        tz = utc
+    else:
+        hours, rem = divmod(abs(offset), 60)
+        tzname = 'UTC%+03d:%02d' % ((hours, -hours)[offset < 0], rem)
+        tz = tzinfo.TZ(offset, tzname)
+    return datetime.fromtimestamp(ts, tz)
 
-    def __init__(self, path, origin=None):
-        """Initialize a new repository from an existing directory.
+class Base(object):
+    def __init__(self):
+        pass
 
-        Args:
-            path: A string containing the path to the repository.
-        """
-        self.logger = logging.getLogger('git_repo.core.quit')
-        self.logger.debug('GitRepo, init, Create an instance of GitStore')
+    def __prov__(self):
+        pass
+
+
+class Repository(Base):
+    def __init__(self, path, **params):
+        origin = params.get('origin', None)
+
+        try:
+            self._repository = pygit2.Repository(path)
+        except KeyError:
+            if not params.get('create', False):
+                raise RepositoryNotFound('Repository "%s" does not exist' % path)
+                        
+            if origin:
+                self.callback = self._callback(origin)
+                pygit2.clone_repository(url=origin, path=path, bare=False)
+            else:
+                pygit2.init_repository(path)
+
+        name = os.path.basename(path).lower()
+
+        self.name = name
         self.path = path
+        self.params = params
 
-        if not exists(path):
-            try:
-                makedirs(path)
-            except OSError as e:
-                raise Exception('Can\'t create path in filesystem:', path, e)
-
-        try:
-            self.repo = Repository(path)
-        except:
-            pass
-
-        if origin:
-            self.callback = self.setCallback(origin)
-
-        if self.repo:
-            if self.repo.is_bare:
-                raise Exception('Bare repositories not supported, yet')
-
-            if origin:
-                # set remote
-                self.addRemote('origin', origin)
-        else:
-            if origin:
-                # clone
-                self.cloneRepository(origin, path, self.callback)
-            else:
-                self.repo = init_repository(path=path, bare=False)
-
-    def cloneRepository(self, origin, path, callback):
-        try:
-            repo = clone_repository(
-                url=origin,
-                path=path,
-                bare=False,
-                callbacks=callback
-            )
-            self.addRemote('origin', origin)
-            return repo
-        except:
-            raise Exception('Could not clone from', origin)
-
-    def addall(self):
-        """Add all (newly created|changed) files to index."""
-        self.repo.index.read()
-        self.repo.index.add_all(self.pathspec)
-        self.repo.index.write()
-
-    def addfile(self, filename):
-        """Add a file to the index.
-
-        Args:
-            filename: A string containing the path to the file.
-        """
-        index = self.repo.index
-        index.read()
-
-        try:
-            index.add(filename)
-            index.write()
-        except:
-            self.logger.debug('GitRepo, addfile, Couldn\'t add file', filename)
-
-    def addRemote(self, name, url):
-        """Add a remote.
-
-        Args:
-            name: A string containing the name of the remote.
-            url: A string containing the url to the remote.
-        """
-        try:
-            self.repo.remotes.create(name, url)
-            self.logger.debug('GitRepo, addRemote, successfully added remote', name, url)
-        except:
-            self.logger.debug('GitRepo, addRemote, could not add remote', name, url)
-
-        try:
-            self.repo.remotes.set_push_url(name, url)
-            self.repo.remotes.set_url(name, url)
-        except:
-            self.logger.debug('GitRepo, addRemote, could not set urls', name, url)
-
-    def checkout(self, commitid):
-        """Checkout a commit by a commit id.
-
-        Args:
-            commitid: A string cotaining a commitid.
-        """
-        try:
-            commit = self.repo.revparse_single(commitid)
-            self.repo.set_head(commit.oid)
-            self.repo.reset(commit.oid, GIT_RESET_HARD)
-            self.logger.debug('GitRepo, checkout, Checked out commit:', commitid)
-        except:
-            self.logger.debug('GitRepo, checkout, Commit-ID (' + commitid + ') does not exist')
-
-    def commit(self, message=None):
-        """Commit staged files.
-
-        Args:
-            message: A string for the commit message.
-        Raises:
-            Exception: If no files in staging area.
-        """
-        if self.isstagingareaclean():
-            # nothing to commit
-            return
-
-        # tree = self.repo.TreeBuilder().write()
-
-        index = self.repo.index
-        index.read()
-        tree = index.write_tree()
-
-        try:
-            author = Signature(self.author_name, self.author_email)
-            comitter = Signature(self.author_name, self.author_email)
-
-            if len(self.repo.listall_reference_objects()) == 0:
-                # Initial Commit
-                if message is None:
-                    message = 'Initial Commit from QuitStore'
-                self.repo.create_commit('HEAD',
-                                        author, comitter, message,
-                                        tree,
-                                        [])
-            else:
-                if message is None:
-                    message = 'New Commit from QuitStore'
-                self.repo.create_commit('HEAD',
-                                        author, comitter, message,
-                                        tree,
-                                        [self.repo.head.get_object().hex]
-                                        )
-            self.logger.debug('GitRepo, commit, Updates commited')
-        except:
-            self.logger.debug('GitRepo, commit, Nothing to commit')
-
-    def commitexists(self, commitid):
-        """Check if a commit id is part of the repository history.
-
-        Args:
-            commitid: String of a Git commit id.
-        Returns:
-            True, if commitid is part of commit log
-            False, else.
-        """
-        if commitid in self.getids():
-            return True
-        else:
-            return False
-
-    def garbagecollection(self):
-        """Start garbage collection.
-
-        Args:
-            commitid: A string cotaining a commitid.
-        """
-        try:
-            """
-            Check if the garbage collection process is still running
-            """
-            if self.gcProcess is None or self.gcProcess.poll() is not None:
-                """
-                Start garbage collection with "--auto" option, which imidietly terminates, if it is not necessary
-                """
-                self.gcProcess = Popen(["git", "gc", "--auto", "--quiet"])
-        except Exception as e:
-            self.logger.debug('Git garbage collection failed to spawn')
-        return
-
-    def getpath(self):
-        """Return the path of the git repository.
-
-        Returns:
-            A string containing the path to the directory of git repo
-        """
-        return self.path
-
-    def getcommits(self):
-        """Return meta data about exitsting commits.
-
-        Returns:
-            A list containing dictionaries with commit meta data
-        """
-        commits = []
-        if len(self.repo.listall_reference_objects()) > 0:
-            for commit in self.repo.walk(self.repo.head.target, GIT_SORT_REVERSE):
-                # commitdate = datetime.fromtimestamp(float(commit.date)).strftime('%Y-%m-%d %H:%M:%S')
-                commits.append({
-                    'id': str(commit.oid),
-                    'message': str(commit.message),
-                    'commit_date': datetime.fromtimestamp(
-                        commit.commit_time).strftime('%Y-%m-%dT%H:%M:%SZ'),
-                    'author_name': commit.author.name,
-                    'author_email': commit.author.email,
-                    'parents': [c.hex for c in commit.parents],
-                    }
-                )
-        return commits
-
-    def getids(self):
-        """Return meta data about exitsting commits.
-
-        Returns:
-            A list containing dictionaries with commit meta data
-        """
-        ids = []
-        if len(self.repo.listall_reference_objects()) > 0:
-            for commit in self.repo.walk(self.repo.head.target, GIT_SORT_REVERSE):
-                ids.append(str(commit.oid))
-        return ids
-
-    def isCallbackSet(self):
-        """Checks if an authentication callback is already defined in the current GitRepo object.
-
-        Returns:
-            True if callback is set, else False
-        """
-        if self.callback is None:
-            return False
-
-        return True
-
-    def isstagingareaclean(self):
-        """Check if staging area is clean.
-
-        Returns:
-            True, if staginarea is clean
-            False, else.
-        """
-        status = self.repo.status()
-
-        for filepath, flags in status.items():
-            if flags != GIT_STATUS_CURRENT:
-                return False
-
-        return True
-
-    def pull(self, remote='origin', branch='master'):
-        """Pull if possible.
-
-        Return:
-            True: If successful.
-            False: If merge not possible or no updates from remote.
-        """
-        try:
-            self.repo.remotes[remote].fetch()
-        except:
-            self.logger.debug('GitRepo, pull,  No remote', remote)
-
-        ref = 'refs/remotes/' + remote + '/' + branch
-        remoteid = self.repo.lookup_reference(ref).target
-        analysis, _ = self.repo.merge_analysis(remoteid)
-
-        if analysis & GIT_MERGE_ANALYSIS_UP_TO_DATE:
-            # Already up-to-date
-            pass
-        elif analysis & GIT_MERGE_ANALYSIS_FASTFORWARD:
-            # fastforward
-            self.repo.checkout_tree(self.repo.get(remoteid))
-            master_ref = self.repo.lookup_reference('refs/heads/master')
-            master_ref.set_target(remoteid)
-            self.repo.head.set_target(remoteid)
-        elif analysis & GIT_MERGE_ANALYSIS_NORMAL:
-            self.repo.merge(remoteid)
-            tree = self.repo.index.write_tree()
-            msg = 'Merge from ' + remote + ' ' + branch
-            author = Signature(self.author_name, self.author_email)
-            comitter = Signature(self.author_name, self.author_email)
-            self.repo.create_commit('HEAD',
-                                    author,
-                                    comitter,
-                                    msg,
-                                    tree,
-                                    [self.repo.head.target, remoteid])
-            self.repo.state_cleanup()
-        else:
-            self.logger.debug('GitRepo, pull, Unknown merge analysis result')
-
-    def push(self, remote='origin', branch='master'):
-        """Push if possible.
-
-        Return:
-            True: If successful.
-            False: If diverged or nothing to push.
-        """
-        ref = ['refs/heads/' + branch]
-
-        try:
-            remo = self.repo.remotes[remote]
-        except:
-            self.logger.debug('GitRepo, push, Remote:', remote, 'does not exist')
-            return
-
-        try:
-            remo.push(ref, callbacks=self.callback)
-        except:
-            self.logger.debug('GitRepo, push, Can not push to', remote, 'with ref', ref)
-
-    def getRemotes(self):
-        remotes = {}
-
-        try:
-            for remote in self.repo.remotes:
-                remotes[remote.name] = [remote.url, remote.push_url]
-        except:
-            return {}
-
-        return remotes
-
-    def setCallback(self, origin):
+    def _callback(self, origin):
         """Set a pygit callback for user authentication when acting with remotes.
-
         This method uses the private-public-keypair of the ssh host configuration.
         The keys are expected to be found at ~/.ssh/
         Warning: Create a keypair that will be used only in QuitStore and do not use
         existing keypairs.
-
         Args:
             username: The git username (mostly) given in the adress.
             passphrase: The passphrase of the private key.
@@ -986,3 +559,814 @@ class GitRepo:
             return
 
         return RemoteCallbacks(credentials=credentials)
+
+    def _clone(self, origin, path):
+        try:
+            self.addRemote('origin', origin)
+            repo = pygit2.clone_repository(url=origin, path=path, bare=False, callbacks=self.callback)
+            return repo
+        except:
+            raise Exception('Could not clone from', origin)
+
+    @property
+    def is_empty(self):
+        return self._repository.is_empty
+
+    @property
+    def is_bare(self):
+        return self._repository.is_bare
+
+    def close(self):
+        self._repository = None
+
+    def revision(self, id='HEAD'):
+        try:
+            commit = self._repository.revparse_single(id)
+        except KeyError:
+            raise RevisionNotFound(id)
+
+        return Revision(self, commit)
+
+    def revisions(self, name=None, order=pygit2.GIT_SORT_REVERSE):
+        seen = set()
+
+        def lookup(name):
+            for template in ['refs/heads/%s', 'refs/tags/%s']:
+                try:                                                           
+                    return self._repository.lookup_reference(template % name)
+                except KeyError:                                                        
+                    pass
+            raise RevisionNotFound(ref)
+        
+        def traverse(ref, seen):
+            for commit in self._repository.walk(ref.target, order):
+                oid = commit.oid
+                if oid not in seen:
+                    seen.add(oid)
+                    yield Revision(self, commit)
+
+        def iter_commits(name, seen):
+            commits = []
+            
+            if not name:
+                for name in self.branches:
+                    ref = self._repository.lookup_reference(name)
+                    commits += traverse(ref, seen)
+            else:
+                ref = lookup(name)
+                commits += traverse(ref, seen)
+            return commits
+        
+        return iter_commits(name, seen)
+
+    @property
+    def branches(self):
+        return [x for x in self._repository.listall_references() if x.startswith('refs/heads/')]
+
+    @property
+    def tags(self):
+        return [x for x in self._repository.listall_references() if x.startswith('refs/tags/')]
+
+    @property
+    def tags_or_branches(self):
+        return [x for x in self._repository.listall_references() if x.startswith('refs/tags/') or x.startswith('refs/heads/')]
+
+    def index(self, revision=None):
+        index = Index(self)
+        if revision:
+            index.set_revision(revision)
+        return index
+
+    def pull(self, remote_name='origin', branch='master'):
+        for remote in self._repository.remotes:
+            if remote.name == remote_name:
+                remote.fetch()
+                remote_master_id = self._repository.lookup_reference('refs/remotes/origin/%s' % (branch)).target
+                merge_result, _ = self._repository.merge_analysis(remote_master_id)
+                
+                # Up to date, do nothing
+                if merge_result & pygit2.GIT_MERGE_ANALYSIS_UP_TO_DATE:
+                    return
+
+                # We can just fastforward
+                elif merge_result & pygit2.GIT_MERGE_ANALYSIS_FASTFORWARD:
+                    self._repository.checkout_tree(self._repository.get(remote_master_id))
+                    try:
+                        master_ref = self._repository.lookup_reference('refs/heads/%s' % (branch))
+                        master_ref.set_target(remote_master_id)
+                    except KeyError:
+                        self._repository.create_branch(branch, repo.get(remote_master_id))
+                    self._repository.head.set_target(remote_master_id)
+                
+                elif merge_result & pygit2.GIT_MERGE_ANALYSIS_NORMAL:
+                    self._repository.merge(remote_master_id)
+
+                    if self._repository.index.conflicts is not None:
+                        for conflict in repo.index.conflicts:
+                            print('Conflicts found in:', conflict[0].path)
+                        raise AssertionError('Conflicts, ahhhhh!!')
+
+                    user = self._repository.default_signature
+                    tree = self._repository.index.write_tree()
+                    commit = self._repository.create_commit('HEAD',
+                                                user,
+                                                user,
+                                                'Merge!',
+                                                tree,
+                                                [self._repository.head.target, remote_master_id])
+                    # We need to do this or git CLI will think we are still merging.
+                    self._repository.state_cleanup()
+                else:
+                    raise AssertionError('Unknown merge analysis result')
+
+    def push(self, remote_name='origin', ref='refs/heads/master:refs/heads/master'):
+        for remote in self._repository.remotes:
+            if remote.name == remote_name:
+                remote.push(ref)
+
+    def __prov__(self):
+
+        commit_graph = self.instance(commit.id, True)
+        pass
+
+
+class Revision(Base):
+    re_parser = re.compile(
+        r'(?P<key>[\w\-_]+): ((?P<value>[^"\n]+)|"(?P<multiline>.+)")',
+        re.DOTALL
+    )
+
+    def __init__(self, repository, commit):
+
+        message = commit.message.strip()
+        properties, message = self._parse_message(commit.message)
+        author = Signature(commit.author.name, commit.author.email, _git_timestamp(commit.author.time, commit.author.offset), commit.author.offset)
+        committer = Signature(commit.committer.name, commit.committer.email, _git_timestamp(commit.committer.time, commit.committer.offset), commit.committer.offset)
+
+        self.id = commit.hex
+        self.short_id = self.id[:10]
+        self.message = message
+        self.author = author
+        self.author_date = author.datetime
+        self.committer = committer
+        self.committer_date = committer.datetime
+
+        self._repository = repository
+        self._commit = commit
+        self._parents = None
+        self._properties = properties
+
+    def _parse_message(self, message):
+        found = dict()
+        idx=-1
+        lines = message.splitlines()
+        for line in lines:
+            idx += 1
+            m = re.match(self.re_parser, line)
+            if m is not None:
+                found[m.group('key')] = m.group('value') or m.group('multiline')
+            else:
+                break
+        return (found, '\n'.join(lines[idx:]))
+
+    @property
+    def properties(self):
+        return self._properties
+
+    @property
+    def parents(self):
+        if self._parents is None:
+            self._parents = [Revision(self._repository, id) for id in self._commit.parents]
+        return self._parents
+
+    def node(self, path=None):
+        return Node(self._repository, self._commit, path)
+
+    def graph(store):
+        mapping = dict()
+
+        for entry in self.node().entries(recursive=True):
+            if not entry.is_file:
+                continue
+            
+            for (public_uri, g) in entry.graph(store):
+                if public_uri is None:
+                    continue
+
+                mapping[public_uri] = g 
+            
+        return InstanceGraph(mapping) 
+
+    def __prov__(self):
+
+        uri = QUIT['commit-' + self.id]
+
+        g = ConjunctiveGraph(identifier=QUIT.default)
+
+        # default activity
+        g.add((uri, is_a, PROV['Activity']))
+
+        # special activity
+        if 'import' in self.properties.keys(): 
+            g.add((uri, is_a, QUIT['Import']))
+            g.add((uri, QUIT['dataSource'], URIRef(self.properties['import'].strip())))
+
+        # properties
+        g.add((uri, PROV['startedAtTime'], Literal(self.author_date, datatype = XSD.dateTime)))
+        g.add((uri, PROV['endedAtTime'], Literal(self.committer_date, datatype = XSD.dateTime)))
+        g.add((uri, RDFS['comment'], Literal(self.message)))
+
+        # parents
+        for parent in self.parents:
+            parent_uri = QUIT['commit-' + parent.id]
+            g.add((uri, QUIT["preceedingCommit"], parent_uri))               
+
+        g.add((role_author, is_a, PROV['Role']))
+        g.add((role_committer, is_a, PROV['Role']))
+
+        # author
+        (author_uri, author_graph) = self.author.__prov__()
+
+        g += author_graph
+        g.add((uri, PROV['wasAssociatedWith'], author_uri))
+
+        qualified_author = BNode()
+        g.add((uri, PROV['qualifiedAssociation'], qualified_author))
+        g.add((qualified_author, is_a, PROV['Association']))
+        g.add((qualified_author, PROV['agent'], author_uri))
+        g.add((qualified_author, PROV['role'], role_author))
+
+        # commiter
+        if self.author.name != self.committer.name:
+            (committer_uri, committer_graph) = self.committer.__prov__()
+
+            g += committer_graph
+            g.add((uri, PROV['wasAssociatedWith'], committer_uri))
+
+            qualified_committer = BNode()
+            g.add((uri, PROV['qualifiedAssociation'], qualified_committer))
+            g.add((qualified_committer, is_a, PROV['Association']))
+            g.add((qualified_committer, PROV['agent'], author_uri))
+            g.add((qualified_committer, PROV['role'], role_committer))
+        else:
+            g.add((qualified_author, PROV['role'], role_committer))
+
+        # diff
+        diff = graphdiff(parent_graph, commit_graph)
+        for ((resource_uri, hex), changesets) in diff.items():
+            for (op, update_graph) in changesets:
+                update_uri = QUIT['update-' + hex]
+                op_uri = QUIT[op + '-' + hex]
+                g.add((uri, QUIT['updates'], update_uri))
+                g.add((update_uri, QUIT['graph'], resource_uri))
+                g.add((update_uri, QUIT[op], op_uri))                    
+                g.addN((s, p, o, op_uri) for s, p, o in update_graph)
+
+        # entities
+        for entity in self.node().entries(recursive=True):
+            for (entity_uri, entity_graph) in self.committer.__prov__():
+                g += entity_graph
+                g.add((entity_uri, PROV['wasGeneratedBy'], uri))
+
+        return (uri, g)
+
+
+class Signature(Base):
+
+    def __init__(self, name, email, datetime, offset):
+        self.name = name
+        self.email = email
+        self.offset = offset
+        self.datetime = datetime
+
+    def __str__(self):
+        return '{name} <{email}> {date}{offset}'.format(**self.__dict__)
+
+    def __repr__(self):
+        return '<{0}> {1}'.format(self.__class__.__name__, self.name).encode('UTF-8')
+
+    def __prov__(self):
+
+        hash = pygit2.hash(self.email).hex
+        uri = QUIT['user-' + hash]
+        
+        g = ConjunctiveGraph(identifier=QUIT.default)
+
+        g.add((uri, is_a, PROV['Agent']))
+        g.add((uri, RDFS.label, Literal(self.name)))
+        g.add((uri, FOAF.mbox, Literal(self.email)))
+
+        return (uri,g)
+
+
+class Node(Base):
+    
+    DIRECTORY = "dir"
+    FILE = "file"
+
+    def __init__(self, repository, commit, path=None):
+
+        if path in (None, '', '.'):
+            self.obj = commit.tree
+            self.name = ''
+            self.kind = Node.DIRECTORY
+            self.tree = self.obj
+        else:
+            try:
+                entry = commit.tree[path]
+            except KeyError:
+                raise NodeNotFound(path, commit.hex)
+            self.obj = repository._repository.get(entry.oid)
+            self.name = clean_path(path)
+            if self.obj.type == pygit2.GIT_OBJ_TREE:
+                self.kind = Node.DIRECTORY
+                self.tree = self.obj
+            elif self.obj.type == pygit2.GIT_OBJ_BLOB:
+                self.kind = Node.FILE
+                self.blob = self.obj
+
+        self._repository = repository
+        self._commit = commit
+
+    @property
+    def is_dir(self) :
+        return self.kind == Node.DIRECTORY
+
+    @property
+    def is_file(self) :
+        return self.kind == Node.FILE
+
+    @property
+    def dirname(self):
+        return os.path.dirname(self.name)
+
+    @property
+    def basename(self):
+        return os.path.basename(self.name)
+
+    @property
+    def content(self):
+        if not self.is_file:
+            return None
+        return self.blob.data.decode("utf-8")
+
+    def entries(self, recursive=False):
+        if isinstance(self.obj, pygit2.Tree):            
+            for entry in self.obj:
+                dirname = self.is_dir and self.name or self.dirname
+                node = Node(self._repository, self._commit, '/'.join(x for x in [dirname, entry.name] if x))
+
+                yield node
+                if recursive and node.is_dir and node.obj is not None:
+                    for x in node.entries(recursive=True):
+                        yield x
+
+    @property
+    def content_length(self):
+        if self.is_file:
+            return self.blob.size
+        return None
+
+    def graph(store):
+        if self.is_file:
+
+            tmp = ConjunctiveGraph()
+            tmp.parse(data=self.content, format='nquads')  
+
+            for context in tmp.context():
+
+                public_uri = QUIT[context]
+                private_uri = QUIT[context + '-' + self.blob.hex]
+            
+                g = ReadOnlyRewriteGraph(entry.blob.hex, identifier=private_uri)
+                g.parse(data=entry.content, format='nquads')
+
+                yield (public_uri, g)
+
+
+    def __prov__(self):       
+        if self.is_file:
+
+            tmp = ConjunctiveGraph()
+            tmp.parse(data=self.content, format='nquads')  
+
+            for context in tmp.context():
+                g = ConjunctiveGraph(identifier=QUIT.default)
+                
+                public_uri = QUIT[context]
+                private_uri = QUIT[context + '-' + self.blob.hex]
+
+                g.add((private_uri, is_a, PROV['Entity']))
+                g.add((private_uri, PROV['specializationOf'], public_uri))
+                g.addN((s, p, o, private_uri) for s, p, o, _ in tmp.quads(None, None, None, context))
+
+                yield (private_uri, g)
+
+from heapq import heappush, heappop
+
+
+class Index(object):
+    def __init__(self, repository):
+        self.repository = repository
+        self.revision = None
+        self.stash = {}
+        self.contents = set()
+        self.dirty = False
+
+    def set_revision(self, revision):
+        try:
+            self.revision = self.repository.revision(revision)
+        except RevisionNotFound as e:
+            raise IndexError(e)
+
+    def add(self, path, contents, mode=None):
+        path = clean_path(path)
+
+        oid = self.repository._repository.create_blob(contents)
+
+        self.stash[path] = (oid, mode or pygit2.GIT_FILEMODE_BLOB)
+        self.contents.add(contents)
+
+    def remove(self, path):
+        path = clean_path(path)
+
+        self.stash[path] = (None, None)
+
+    def commit(self, message, author_name, author_email, **kwargs):
+        if self.dirty:
+            raise IndexError('Index already commited')
+
+        ref = kwargs.pop('ref', 'HEAD')
+        commiter_name = kwargs.pop('commiter_name', author_name)
+        commiter_email = kwargs.pop('commiter_email', author_email)
+        parents = kwargs.pop('parents', [self.revision.id] if self.revision else [])
+
+        author = pygit2.Signature(author_name, author_email)
+        commiter = pygit2.Signature(commiter_name, commiter_email)
+
+        # Sort index items
+        items = sorted(self.stash.items(), key=lambda x: (x[1][0], x[0]))
+        print(items)
+
+        # Create tree
+        tree = IndexTree(self)
+        while len(items) > 0:
+            path, (oid, mode) = items.pop(0)
+
+            if oid is None:
+                tree.remove(path)
+            else:
+                tree.add(path, oid, mode)
+
+        oid = tree.write()
+        self.dirty = True
+
+        try:
+            return self.repository._repository.create_commit(ref, author, commiter, message, oid, parents)
+        except Exception as e:
+            print(e)
+            return None
+
+
+class IndexHeap(object):
+    def __init__(self):
+        self._dict = {}
+        self._heap = []
+
+    def __len__(self):
+        return len(self._dict)
+
+    def get(self, path):
+        return self._dict.get(path)
+
+    def __setitem__(self, path, value):
+        if path not in self._dict:
+            n = -path.count(os.sep) if path else 1
+            heappush(self._heap, (n, path))
+
+        self._dict[path] = value
+
+    def popitem(self):
+        key = heappop(self._heap)
+        path = key[1]
+        return path, self._dict.pop(path)
+
+
+class IndexTree(object):
+    def __init__(self, index):
+        self.repository = index.repository
+        self.revision = index.revision
+        self.builders = IndexHeap()
+        if self.revision:
+            self.builders[''] = (None, self.repository._repository.TreeBuilder(self.revision._commit.tree))
+        else:
+            self.builders[''] = (None, self.repository._repository.TreeBuilder())
+
+    def get_builder(self, path):
+        parts = path.split(os.path.sep)
+
+        # Create builders if needed
+        for i in range(len(parts)):
+            _path = os.path.join(*parts[0:i + 1])
+
+            if self.builders.get(_path):
+                continue
+
+            args = []
+            try:
+                if self.revision:
+                    node = self.revision.node(_path)
+                    if node.is_file:
+                        raise IndexError('Cannot create a tree builder. "{0}" is a file'.format(node.name))
+                    args.append(node.obj.oid)
+            except NodeNotFound:
+                pass
+
+            self.builders[_path] = (os.path.dirname(
+                _path), self.repository._repository.TreeBuilder(*args))
+
+        return self.builders.get(path)[1]
+
+    def add(self, path, oid, mode):
+        builder = self.get_builder(os.path.dirname(path))
+        builder.insert(os.path.basename(path), oid, mode)
+
+    def remove(self, path):
+        self.revision.node(path)
+        builder = self.get_builder(os.path.dirname(path))
+        builder.remove(os.path.basename(path))
+
+    def write(self):
+        """
+        Attach and writes all builders and return main builder oid
+        """
+        # Create trees
+        while len(self.builders) > 0:
+            path, (parent, builder) = self.builders.popitem()
+            if parent is not None:
+                oid = builder.write()
+                builder.clear()
+                self.builders.get(parent)[1].insert(
+                    os.path.basename(path), oid, pygit2.GIT_FILEMODE_TREE)
+
+        oid = builder.write()
+        builder.clear()
+
+        return oid
+
+
+#######################################
+# Graph Extensions for rewriting
+#######################################
+
+class ReadOnlyRewriteGraph(Graph):
+    def __init__(self, store='default', identifier = None, rewritten_identifier = None, namespace_manager = None):
+        super().__init__(store=store, identifier=rewritten_identifier, namespace_manager=namespace_manager)
+        self.__graph = Graph(store=store, identifier=identifier, namespace_manager=namespace_manager)
+
+    def triples(self, triple):
+        return self.__graph.triples(triple)
+   
+    def __cmp__(self, other):
+        if other is None:
+            return -1
+        elif isinstance(other, Graph):
+            return -1
+        elif isinstance(other, ReadOnlyRewriteGraph):
+            return cmp(self.__graph, other.__graph)
+        else:
+            return -1
+    
+    def add(self, triple_or_quad):
+        raise ModificationException()
+
+    def addN(self, triple_or_quad):
+        raise ModificationException()
+
+    def remove(self, triple_or_quad):
+        raise ModificationException()
+
+    def __iadd__(self, other):
+        raise ModificationException()
+
+    def __isub__(self, other):
+        raise ModificationException()
+
+    def parse(self, source, publicID=None, format="xml", **args):
+        raise ModificationException()
+
+    def __len__(self):
+        return len(self.__graph)
+
+
+class InMemoryGraphAggregate(ConjunctiveGraph):
+    def __init__(self, graphs=list(), identifier=None):                
+        self.__memory_store = IOMemory()        
+        super().__init__(self.__memory_store, identifier)
+        
+        assert isinstance(graphs, list), "graphs argument must be a list of Graphs!!"
+        self.__graphs = graphs
+
+    class InMemoryGraph(Graph):
+        def __init__(self, store = 'default', identifier = None, namespace_manager = None, external = None):            
+            super().__init__(store, identifier, namespace_manager)
+            self.__external = external
+
+        def force(self):
+            if self.__external is not None and self not in self.store.contexts():
+                self.store.addN((s, p, o, self) for s, p, o in self.__external.triples((None, None, None)))
+        
+        def add(self, triple_or_quad):
+            self.force()
+            super().add(triple_or_quad)
+
+        def addN(self, triple_or_quad):
+            self.force()
+            super().addN(triple_or_quad)
+
+        def remove(self, triple_or_quad):
+            self.force()
+            super().remove(triple_or_quad)
+
+    def __repr__(self):
+        return "<InMemoryGraphAggregate: %s graphs>" % len(self.graphs)
+
+    @property
+    def is_dirty(self):
+        return len(self.store) > 0
+
+    def _spoc(self, triple_or_quad, default=False):
+        """
+        helper method for having methods that support
+        either triples or quads
+        """
+        if triple_or_quad is None:
+            return (None, None, None, self.default_context if default else None)
+        if len(triple_or_quad) == 3:
+            c = self.default_context if default else None
+            (s, p, o) = triple_or_quad
+        elif len(triple_or_quad) == 4:
+            (s, p, o, c) = triple_or_quad
+            c = self._graph(c)
+        return s,p,o,c
+
+    def _graph(self, c):
+        if c is None: return None
+        if not isinstance(c, Graph):
+            return self.get_context(c)
+        else:
+            return c
+
+    def add(self, triple_or_quad):
+        s,p,o,c = self._spoc(triple_or_quad, default=True)
+        self.store.add((s, p, o), context=c, quoted=False)
+
+    def addN(self, quads):
+        self.store.addN((s, p, o, self._graph(c)) for s, p, o, c in quads)
+
+    def remove(self, triple_or_quad):
+        s,p,o,c = self._spoc(triple_or_quad)
+        self.store.remove((s, p, o), context=c_copy(c))
+
+    def contexts(self, triple=None):
+        for graph in self.__graphs:
+            if graph.identifier not in (c.identifier for c in self.store.contexts()):
+                yield graph
+        for graph in self.store.contexts():
+            yield graph
+
+    graphs = contexts
+
+    def triples(self, triple_or_quad, context=None):
+        s,p,o,c = self._spoc(triple_or_quad)
+        context = self._graph(context or c)
+
+        if isinstance(p, Path):
+            for s, o in p.eval(self, s, o):
+                yield s, p, o
+        else:
+            for graph in self.graphs():
+                if context is None or graph.identifier == context.identifier:
+                    for s, p, o in graph.triples((s, p, o)):
+                        yield s, p, o
+
+    def quads(self, triple_or_quad=None):
+        s,p,o,c = self._spoc(triple_or_quad)
+        context = self._graph(c)
+
+        for graph in self.graphs():
+           if context is None or graph.identifier == context.identifier:
+                for s1, p1, o1 in graph.triples((s, p, o)):
+                    yield (s1, p1, o1, graph)
+
+    def graph(self, identifier=None):
+        for graph in self.graphs():
+           if str(graph.identifier) == str(identifier):
+               return graph
+        
+        return self.get_context(identifier)
+
+    def __contains__(self, triple_or_quad):
+        (_,_,_,context) = self._spoc(triple_or_quad)
+        for graph in self.graphs():
+            if context is None or graph.identifier == context.identifier:
+                if triple_or_quad[:3] in graph:
+                    return True
+        return False
+
+    
+
+    def _default(self, identifier):
+        return next( (x for x in self.__graphs if x.identifier == identifier), None)
+
+    def get_context(self, identifier, quoted=False):   
+        if not isinstance(identifier, Node):
+            identifier = URIRef(identifier)     
+        return InMemoryGraphAggregate.InMemoryGraph(store=self.__memory_store, identifier=identifier, namespace_manager=self, external=self._default(identifier))
+
+#######################################
+# Provenance
+#######################################
+
+class Blame(object):
+    """
+    Reusable Blame object for web client
+    """
+    def __init__(self, quit):
+        self.quit = quit
+
+    def _generate_values(self, quads):
+        result = list()
+
+        for quad in quads:  
+            (s, p, o, c) = quad
+
+            c.rewrite = True
+            
+            # Todo: BNodes in VALUES are not supported by specification? Using UNDEF for now
+            _s = 'UNDEF' if isinstance(s, BNode) else s.n3()
+            _p = 'UNDEF' if isinstance(p, BNode) else p.n3()
+            _o = 'UNDEF' if isinstance(o, BNode) else o.n3()
+            _c = 'UNDEF' if isinstance(c, BNode) else c.identifier.n3()
+
+            c.rewrite= False
+
+            result.append((_s, _p, _o, _c))
+        return result
+
+    def run(self, quads=None, branch_or_ref='master'):
+        """
+        Annotated every quad with the respective author
+
+        Args:
+                querystring: A string containing a SPARQL ask or select query.
+        Returns:
+                The SPARQL result set
+        """
+
+
+        commit = self.quit.repository.revision(branch_or_ref)
+        g = self.quit.instance(branch_or_ref)    
+
+        #if not quads:
+        quads = [x for x in g.store.quads((None, None, None))]
+
+        print(quads)
+
+        values = self._generate_values(quads)
+        values_string = ft.reduce(lambda acc, quad: acc + '( %s %s %s %s )\n' % quad, values, '') 
+
+        print(values_string)
+
+        q = """
+            SELECT ?s ?p ?o ?context ?hex ?name ?email ?date WHERE {                
+                ?commit quit:preceedingCommit* ?c .
+                ?c      prov:endedAtTime ?date ;
+                        prov:qualifiedAssociation ?qa ;
+                        quit:updates ?update ;
+                        quit:hex ?hex .
+                ?qa     prov:agent ?user ;
+                        prov:role quit:author .
+                ?user   foaf:mbox ?email ;
+                        rdfs:label ?name .                    
+                ?update quit:graph ?context ;
+                        quit:additions ?additions . 
+                GRAPH ?additions {
+                    ?s ?p ?o 
+                } 
+                FILTER NOT EXISTS {
+                    ?y quit:preceedingCommit+ ?z . 
+                    ?z quit:updates ?update2 .
+                    ?update2 quit:graph ?g ;
+                        quit:removals ?removals . 
+                    GRAPH ?removals {
+                        ?s ?p ?o 
+                    } 
+                }
+                VALUES (?s ?p ?o ?context) {
+                    %s
+                }                                 
+            }                
+            """ % values_string
+
+        return self.quit.store.store.query(q, initNs = { 'foaf': FOAF, 'prov': PROV, 'quit': QUIT }, initBindings = { 'commit': QUIT['commit-' + commit.id] })

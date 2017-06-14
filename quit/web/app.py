@@ -9,12 +9,10 @@ from flask.ext.cors import CORS
 from jinja2 import Environment, contextfilter, Markup
 
 from quit.conf import QuitConfiguration
-from quit.core import MemoryStore, Quit
-from quit.git import Repository
+from quit.core import MemoryStore, Quit, Repository, Blame
 
 from quit.namespace import QUIT
 from quit.web.service import register
-from quit.provenance import Blame
 
 # For import *
 __all__ = ['create_app']

@@ -5,7 +5,6 @@ import contextlib
 import signal
 import sys
 from datetime import tzinfo, timedelta, datetime
-from quit.graphs import InMemoryGraphAggregate
 
 
 ZERO = timedelta(0)
@@ -33,35 +32,6 @@ def clean_path(path):
         path = path[len(os.sep):]
 
     return path
-
-def sparqlresponse(result, format):
-    """Create a FLASK HTTP response for sparql-result+json."""
-    return Response(
-            result.serialize(format=format['format']).decode('utf-8'),
-            content_type=format['mime']
-            )
-
-
-def splitinformation(quads, GraphObject):
-    """Split quads ."""
-    data = []
-    graphsInRequest = set()
-    for quad in quads:
-        graph = quad[3].n3().strip('[]')
-        if graph.startswith('_:', 0, 2):
-            graphsInRequest.add('default')
-            data.append({
-                        'graph': 'default',
-                        'quad': quad[0].n3() + ' ' + quad[1].n3() + ' ' + quad[2].n3() + ' .\n'
-                        })
-        else:
-            graphsInRequest.add(graph.strip('<>'))
-            data.append({
-                        'graph': graph.strip('<>'),
-                        'quad': quad[0].n3() + ' ' + quad[1].n3() + ' ' + quad[2].n3() + ' ' + graph + ' .\n'
-                        })
-    return {'graphs': graphsInRequest, 'data': data, 'GraphObject': GraphObject}
-
 
 def graphdiff(first, second):
     """
